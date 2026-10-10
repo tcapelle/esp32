@@ -22,14 +22,13 @@
 #include <ArduinoJson.h>
 #include <Arduino_GFX_Library.h>
 #include <Adafruit_GFX.h>   // only so the IDE finds the Fonts/ folder below
-#include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
-#include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSansBold24pt7b.h>
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS, generated from .env by flash.sh
 
 // ================= YOUR SETTINGS =================
 const int      STATION_ID   = 2176;
+const int      HISTORY_MIN  = 60;   // minutes of wind shown in the chart (max 60)
 const char*    TIMEZONE     = "CET-1CEST,M3.5.0,M10.5.0/3";  // France
 const int      NIGHT_START  = 22;   // dim the screen from 22:00...
 const int      NIGHT_END    = 7;    // ...until 07:00
@@ -53,7 +52,8 @@ const int      STALE_MIN    = 15;    // grey out data older than this
 const uint16_t C_BLACK = 0x0000;
 const uint16_t C_GREY  = RGB(150, 150, 150);
 const uint16_t C_DIM   = RGB(70, 70, 70);
-const uint16_t C_RED   = RGB(240, 60, 60);
+const uint16_t C_LINE  = RGB(130, 190, 255);  // chart: average
+const uint16_t C_BAND  = RGB(30, 55, 90);     // chart: min-max band
 
 Arduino_DataBus *bus   = new Arduino_ESP32QSPI(LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
 // V2 board (touch chip at I2C 0x15): CO5300, 16 px column offset, as in Waveshare's arduino-v2 demo.
@@ -63,12 +63,17 @@ Arduino_Canvas  *gfx   = new Arduino_Canvas(LCD_W, LCD_H, panel);  // framebuffe
 
 struct Wind {
   bool   valid = false;
-  String name;
   float  avg = 0, mn = 0, mx = 0, heading = 0;
   bool   hasHeading = false;
   bool   stationOn = true;
   time_t measured = 0;
 } wind;
+
+struct Sample { time_t t; float mn, avg, mx; };
+const int HIST_MAX = 48;
+Sample hist[HIST_MAX];
+int    histN = 0;
+bool   histLoaded = false;
 
 bool     useKnots = true;   // default unit; BOOT button toggles
 String   lastError;
@@ -88,12 +93,6 @@ time_t parseIsoUtc(const char* s) {
   return (time_t)days * 86400 + h * 3600 + m * 60 + sec;
 }
 
-const char* cardinal(float deg) {
-  static const char* d[16] = {"N","NNE","NE","ENE","E","ESE","SE","SSE",
-                              "S","SSW","SW","WSW","W","WNW","NW","NNW"};
-  return d[(int)((deg + 11.25f) / 22.5f) % 16];
-}
-
 uint16_t speedColor(float kmh) {
   if (kmh < 12) return RGB(0, 210, 130);    // light
   if (kmh < 20) return RGB(230, 220, 40);   // moderate
@@ -111,26 +110,36 @@ void drawCentered(const char* txt, int cx, int baseline, const GFXfont* f, uint1
   gfx->print(txt);
 }
 
-// station names can be wider than the screen: step down a font, then trim with "..."
-void drawFitted(const char* txt, int cx, int baseline, uint16_t col) {
-  const int maxW = LCD_W - 16;
-  int16_t x1, y1; uint16_t w, h;
-  gfx->setTextSize(1);
-  for (const GFXfont* f : {&FreeSans12pt7b, &FreeSans9pt7b}) {
-    gfx->setFont(f);
-    gfx->getTextBounds(txt, 0, baseline, &x1, &y1, &w, &h);
-    if (w <= maxW) { drawCentered(txt, cx, baseline, f, col); return; }
-  }
-  String s = txt, t;
-  do {
-    s.remove(s.length() - 1);
-    t = s + "...";
-    gfx->getTextBounds(t.c_str(), 0, baseline, &x1, &y1, &w, &h);
-  } while (w > maxW && s.length() > 1);
-  drawCentered(t.c_str(), cx, baseline, &FreeSans9pt7b, col);
+// ---------------- data ----------------
+void pushSample(time_t t, float mn, float avg, float mx) {
+  if (!t || (histN && t <= hist[histN - 1].t)) return;  // only readings newer than what we have
+  if (histN == HIST_MAX) { memmove(hist, hist + 1, sizeof(Sample) * (HIST_MAX - 1)); histN--; }
+  hist[histN++] = {t, mn, avg, mx};
 }
 
-// ---------------- data ----------------
+// the last hour of readings, fetched once; after that each new live reading is appended
+bool fetchHistory() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  http.begin("http://api.pioupiou.fr/v1/archive/" + String(STATION_ID) + "?start=last-hour&stop=now");
+  http.setTimeout(8000);
+  if (http.GET() != 200) { http.end(); return false; }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getString());
+  http.end();
+  if (err) return false;
+
+  // rows are [time, lat, lon, min, avg, max, heading, pressure], oldest first
+  histN = 0;
+  for (JsonArray row : doc["data"].as<JsonArray>()) {
+    if (row[4].isNull()) continue;
+    pushSample(parseIsoUtc(row[0].as<const char*>()), row[3] | 0.0f, row[4] | 0.0f, row[5] | 0.0f);
+  }
+  return true;
+}
+
 bool fetchWind() {
   if (WiFi.status() != WL_CONNECTED) { lastError = "No WiFi"; return false; }
 
@@ -149,7 +158,6 @@ bool fetchWind() {
   JsonObject ms = d["measurements"];
   if (ms["wind_speed_avg"].isNull()) { lastError = "No measurements"; return false; }
 
-  wind.name       = d["meta"]["name"] | "Windbird";
   wind.avg        = ms["wind_speed_avg"] | 0.0f;
   wind.mn         = ms["wind_speed_min"] | 0.0f;
   wind.mx         = ms["wind_speed_max"] | 0.0f;
@@ -159,16 +167,45 @@ bool fetchWind() {
   const char* st  = d["status"]["state"];
   wind.stationOn  = !(st && strcmp(st, "off") == 0);
   wind.valid      = true;
+  pushSample(wind.measured, wind.mn, wind.avg, wind.mx);
   lastError       = "";
   return true;
 }
 
 // ---------------- drawing ----------------
+// last HISTORY_MIN minutes: min-max band with the average on top, no axes or labels
+void drawHistory(int x0, int y0, int w, int h, bool stale) {
+  if (histN < 2) return;
+  time_t tEnd = hist[histN - 1].t;
+  int first = 0;
+  while (first < histN - 2 && hist[first].t < tEnd - HISTORY_MIN * 60) first++;
+  time_t tStart = hist[first].t;
+
+  float lo = hist[first].mn, hi = hist[first].mx;
+  for (int i = first; i < histN; i++) { lo = fminf(lo, hist[i].mn); hi = fmaxf(hi, hist[i].mx); }
+  if (hi - lo < 4) { float mid = (hi + lo) / 2; lo = mid - 2; hi = mid + 2; }  // don't magnify tiny variations
+
+  auto X = [&](int i)   { return x0 + (int)((long)(hist[i].t - tStart) * (w - 1) / (long)(tEnd - tStart)); };
+  auto Y = [&](float v) { return y0 + h - 1 - (int)((v - lo) * (h - 1) / (hi - lo)); };
+  uint16_t band = stale ? RGB(40, 40, 40) : C_BAND, line = stale ? C_GREY : C_LINE;
+
+  for (int i = first; i < histN - 1; i++) {
+    int xa = X(i), xb = X(i + 1);
+    int ta = Y(hist[i].mx), tb = Y(hist[i + 1].mx), ba = Y(hist[i].mn), bb = Y(hist[i + 1].mn);
+    gfx->fillTriangle(xa, ta, xb, tb, xb, bb, band);
+    gfx->fillTriangle(xa, ta, xb, bb, xa, ba, band);
+  }
+  for (int i = first; i < histN - 1; i++) {
+    int xa = X(i), xb = X(i + 1), ya = Y(hist[i].avg), yb = Y(hist[i + 1].avg);
+    gfx->drawLine(xa, ya, xb, yb, line);
+    gfx->drawLine(xa, ya + 1, xb, yb + 1, line);
+  }
+}
+
 void render() {
   // shift everything a few pixels each refresh to limit AMOLED burn-in
   int ox = random(-4, 5), oy = random(-4, 5);
-  int cx = LCD_W / 2 + ox, cy = 200 + oy, R = 130;
-  char buf[48];
+  int cx = LCD_W / 2 + ox, cy = 176 + oy, R = 130;
 
   gfx->fillScreen(C_BLACK);
 
@@ -183,9 +220,6 @@ void render() {
   bool stale = !wind.stationOn || ageMin > STALE_MIN;
   uint16_t accent = stale ? C_GREY : speedColor(wind.avg);
   float k = useKnots ? 1.852f : 1.0f;
-
-  // station name
-  drawFitted(wind.name.c_str(), cx, 32 + oy, C_GREY);
 
   // compass ring with ticks
   gfx->drawCircle(cx, cy, R, C_DIM);
@@ -227,20 +261,7 @@ void render() {
   gfx->setTextSize(1); gfx->setCursor(left + wW + 6, cy + 30); gfx->print(frac);
   drawCentered(useKnots ? "knots" : "km/h", cx, cy + 64, &FreeSans12pt7b, C_GREY);
 
-  // direction, min/max, age
-  int by = cy + R + 42;
-  if (wind.hasHeading) {
-    snprintf(buf, sizeof buf, "from %s (%d)", cardinal(wind.heading), (int)lround(wind.heading));
-    drawCentered(buf, cx, by, &FreeSansBold18pt7b, C_GREY);
-  }
-  snprintf(buf, sizeof buf, "min %.1f   max %.1f", wind.mn / k, wind.mx / k);
-  drawCentered(buf, cx, by + 32, &FreeSans12pt7b, C_GREY);
-
-  if (!wind.stationOn)      snprintf(buf, sizeof buf, "station switched off");
-  else if (ageMin < 0)      snprintf(buf, sizeof buf, " ");
-  else if (ageMin == 0)     snprintf(buf, sizeof buf, "just now");
-  else                      snprintf(buf, sizeof buf, "%ld min ago", ageMin);
-  drawCentered(buf, cx, by + 62, &FreeSans12pt7b, stale ? C_RED : C_DIM);
+  drawHistory(28 + ox, 344 + oy, LCD_W - 56, 88, stale);
 
   gfx->flush();
 }
@@ -273,6 +294,7 @@ void setup() {
   configTzTime(TIMEZONE, "pool.ntp.org", "time.google.com");
   delay(1500);  // give NTP a moment so "min ago" is right on first screen
 
+  histLoaded = fetchHistory();
   fetchWind();
   updateBrightness();
   render();
@@ -292,6 +314,7 @@ void loop() {
   if (millis() - lastPoll >= POLL_MS) {
     lastPoll = millis();
     if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+    if (!histLoaded) histLoaded = fetchHistory();
     fetchWind();          // on failure the last reading stays, and its age keeps counting up
     updateBrightness();
     render();

@@ -5,8 +5,9 @@ A small desk dashboard showing live wind from an [OpenWindMap](https://www.openw
 
 <img src="pic.jpeg" alt="The display on a desk showing 3.4 knots from NNW" width="320">
 
-It shows the average speed (knots, one decimal), min/max, a compass marker for where the wind comes from,
-and how old the reading is. Data is refreshed once a minute from `http://api.pioupiou.fr/v1/live/<id>`.
+It shows the average speed (knots, one decimal), a compass marker for where the wind comes from, and a small
+chart of the last hour (average line over a min-max band). Everything turns grey when the reading is stale.
+Data is refreshed once a minute from `http://api.pioupiou.fr/v1/live/<id>`.
 
 ## Hardware
 
@@ -41,7 +42,7 @@ Partition Scheme "16M Flash (3MB APP/9.9MB FATFS)".
 
 ## Settings
 
-At the top of `windbird_display_1/windbird_display_1.ino`: station id, timezone, night dimming hours, brightness.
+At the top of `windbird_display_1/windbird_display_1.ino`: station id, chart length, timezone, night dimming hours, brightness.
 The BOOT button toggles knots / km/h until the next restart.
 
 ## Data
