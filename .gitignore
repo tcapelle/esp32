@@ -1,0 +1,4 @@
+.env
+secrets.h
+build/
+.DS_Store
