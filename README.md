@@ -3,6 +3,8 @@
 A small desk dashboard showing live wind from an [OpenWindMap](https://www.openwindmap.org/windbird-2176) station
 (Windbird 2176, Lac du Bourget) on a Waveshare ESP32-S3-Touch-AMOLED-1.8.
 
+<img src="pic.jpeg" alt="The display on a desk showing 3.4 knots from NNW" width="320">
+
 It shows the average speed (knots, one decimal), min/max, a compass marker for where the wind comes from,
 and how old the reading is. Data is refreshed once a minute from `http://api.pioupiou.fr/v1/live/<id>`.
 
